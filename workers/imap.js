@@ -1,6 +1,6 @@
 'use strict';
 const { parentPort } = require('worker_threads');
-
+const inspector = require('inspector');
 const packageData = require('../package.json');
 const config = require('wild-config');
 const logger = require('../lib/logger');
@@ -8,6 +8,9 @@ const logger = require('../lib/logger');
 const { REDIS_PREFIX } = require('../lib/consts');
 
 const { getDuration, getBoolean, emitChangeEvent, readEnvValue, hasEnvValue, threadStats } = require('../lib/tools');
+
+inspector.open(0, '0.0.0.0'); // dynamically picks an unused port
+console.log(inspector.url()); // gives you the URL to connect in DevTools
 
 const Bugsnag = require('@bugsnag/js');
 if (readEnvValue('BUGSNAG_API_KEY')) {
@@ -249,12 +252,12 @@ class ConnectionHandler {
         });
     }
 
-    async deleteConnection(account) {
+    async deleteConnection(account, accountData) {
         logger.info({ msg: 'Deleting connection', account });
         if (this.accounts.has(account)) {
             let accountObject = this.accounts.get(account);
             if (accountObject.connection) {
-                await accountObject.connection.delete();
+                await accountObject.connection.delete(accountData);
             }
             this.accounts.delete(account);
         }
@@ -734,7 +737,7 @@ class ConnectionHandler {
             case 'pause':
             case 'resume':
             case 'reconnect':
-                return await this[`${message.cmd}Connection`](message.account);
+                return await this[`${message.cmd}Connection`](message.account, message.data);
 
             case 'assign':
                 return await this[`${message.cmd}Connection`](message.account, message.runIndex);
@@ -763,24 +766,24 @@ class ConnectionHandler {
                 return await this[message.cmd](message);
 
             case 'countConnections': {
-                let results = Object.assign({}, DEFAULT_STATES);
+                const pipeline = redis.pipeline();
 
                 for (let accountObject of this.accounts.values()) {
-                    let state;
-
-                    if (!accountObject || !accountObject.connection) {
-                        state = 'unassigned';
-                    } else {
-                        state = await accountObject.connection.currentState();
-                    }
-
-                    if (!results[state]) {
-                        results[state] = 0;
-                    }
-                    results[state] += 1;
+                    const key = accountObject.connection.getAccountKey();
+                    pipeline.hget(key, 'state');
                 }
+                const results = await pipeline.exec();
 
-                return results;
+                const states = results.reduce((output, result) => {
+                    const [err, state] = result;
+                    const status = err || !state ? 'disconnected' : state;
+                    return {
+                        ...output,
+                        [status]: output[status] + 1
+                    };
+                }, DEFAULT_STATES);
+
+                return states;
             }
 
             default:
