@@ -1884,7 +1884,8 @@ async function onCommand(worker, message) {
         case 'submitMessage':
         case 'queueMessage':
         case 'uploadMessage':
-        case 'getAttachment': {
+        case 'getAttachment':
+        case 'listSignatures': {
             if (!assigned.has(message.account)) {
                 return NO_ACTIVE_HANDLER_RESP;
             }
@@ -2247,6 +2248,9 @@ const startApplication = async () => {
 
     // single worker for HTTP, start first for health checks
     await spawnWorker('api');
+
+    // artificail delay to allow starting api workers in case there is a large number of accounts
+    await new Promise(r => setTimeout(r, 100));
 
     // multiple IMAP connection handlers
     let workerPromises = [];

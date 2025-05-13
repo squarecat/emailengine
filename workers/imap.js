@@ -132,7 +132,7 @@ class ConnectionHandler {
         };
     }
 
-    async assignConnection(account, runIndex) {
+    async assignConnection(account, runIndex, initOpts) {
         logger.info({ msg: 'Assigned account to worker', account });
 
         if (!this.runIndex) {
@@ -247,7 +247,7 @@ class ConnectionHandler {
         }
 
         // do not wait before returning as it may take forever
-        accountObject.connection.init().catch(err => {
+        accountObject.connection.init(initOpts).catch(err => {
             logger.error({ account, err });
         });
     }
@@ -356,7 +356,7 @@ class ConnectionHandler {
                 await accountObject.connection.close();
             }
 
-            await this.assignConnection(account);
+            await this.assignConnection(account, false, { forceWatchRenewal: true });
         }
     }
 
@@ -371,6 +371,19 @@ class ConnectionHandler {
         }
 
         return await accountData.connection.listMessages(message);
+    }
+
+    async listSignatures(message) {
+        if (!this.accounts.has(message.account)) {
+            return NO_ACTIVE_HANDLER_RESP;
+        }
+
+        let accountData = this.accounts.get(message.account);
+        if (!accountData.connection) {
+            return NO_ACTIVE_HANDLER_RESP;
+        }
+
+        return await accountData.connection.listSignatures(message.account);
     }
 
     async getText(message) {
@@ -763,6 +776,7 @@ class ConnectionHandler {
             case 'uploadMessage':
             case 'subconnections':
             case 'externalNotify':
+            case 'listSignatures':
                 return await this[message.cmd](message);
 
             case 'countConnections': {

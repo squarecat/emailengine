@@ -163,7 +163,11 @@ const {
     outboxEntrySchema,
     googleProjectIdSchema,
     googleWorkspaceAccountsSchema,
-    messageReferenceSchema
+    googleTopicNameSchema,
+    googleSubscriptionNameSchema,
+    messageReferenceSchema,
+    idempotencyKeySchema,
+    headerTimeoutSchema
 } = require('../lib/schemas');
 
 const listMessageFolderPathDescription =
@@ -518,6 +522,24 @@ const init = async () => {
 
     handlebars.registerHelper('inc', (nr, inc) => Number(nr) + Number(inc));
 
+    handlebars.registerHelper('json', payload => {
+        let res;
+        try {
+            res = typeof payload === 'undefined' ? 'undefined' : JSON.stringify(payload, false, 2);
+        } catch (err) {
+            res = util.inspect(payload, false, 4, false);
+        }
+        return new handlebars.SafeString(res);
+    });
+
+    handlebars.registerHelper('lastVal', (value, separator) => {
+        separator = separator || '/';
+
+        let res = (value || '').toString().split(separator).pop();
+
+        return new handlebars.SafeString(res);
+    });
+
     handlebars.registerHelper('formatInteger', (intVal, locale) => {
         if (isNaN(intVal)) {
             // ignore non-numbers
@@ -555,13 +577,7 @@ const init = async () => {
                     convert: true
                 },
                 headers: Joi.object({
-                    'x-ee-timeout': Joi.number()
-                        .integer()
-                        .min(0)
-                        .max(2 * 3600 * 1000)
-                        .optional()
-                        .description(`Override the \`EENGINE_TIMEOUT\` environment variable for a single API request (in milliseconds)`)
-                        .label('X-EE-Timeout')
+                    'x-ee-timeout': headerTimeoutSchema
                 }).unknown()
             }
         }
@@ -1804,7 +1820,7 @@ const init = async () => {
 
             if (!request.query.code) {
                 // throw
-                let error = Boom.boomify(new Error(`Oauth failed: node code received`), { statusCode: 400 });
+                let error = Boom.boomify(new Error(`Oauth failed: no code received`), { statusCode: 400 });
                 throw error;
             }
 
@@ -1999,7 +2015,9 @@ const init = async () => {
                         throw error;
                     }
 
-                    if (accountData.delegated && accountData.email && accountData.email !== userInfo.email) {
+                    if (accountData.oauth2 && accountData.oauth2.auth && accountData.oauth2.auth.delegatedUser) {
+                        authData.delegatedUser = accountData.oauth2.auth.delegatedUser;
+                    } else if (accountData.delegated && accountData.email && accountData.email !== userInfo.email) {
                         // Shared mailbox
                         authData.delegatedUser = accountData.email;
                     } else {
@@ -5252,7 +5270,10 @@ const init = async () => {
             });
 
             try {
-                return await accountObject.queueMessage(request.payload, { source: 'api' });
+                return await accountObject.queueMessage(request.payload, {
+                    source: 'api',
+                    idempotencyKey: request.headers['idempotency-key']
+                });
             } catch (err) {
                 request.logger.error({ msg: 'API request failed', err });
                 if (Boom.isBoom(err)) {
@@ -5297,6 +5318,11 @@ const init = async () => {
                 params: Joi.object({
                     account: accountIdSchema.required()
                 }),
+
+                headers: Joi.object({
+                    'x-ee-timeout': headerTimeoutSchema,
+                    'idempotency-key': idempotencyKeySchema
+                }).unknown(),
 
                 payload: Joi.object({
                     reference: messageReferenceSchema,
@@ -6851,6 +6877,8 @@ const init = async () => {
 
                                 googleProjectId: googleProjectIdSchema,
                                 googleWorkspaceAccounts: googleWorkspaceAccountsSchema,
+                                googleTopicName: googleTopicNameSchema,
+                                googleSubscriptionName: googleSubscriptionNameSchema,
 
                                 serviceClientEmail: Joi.string()
                                     .email()
@@ -6980,6 +7008,8 @@ const init = async () => {
 
                     googleProjectId: googleProjectIdSchema,
                     googleWorkspaceAccounts: googleWorkspaceAccountsSchema,
+                    googleTopicName: googleTopicNameSchema,
+                    googleSubscriptionName: googleSubscriptionNameSchema,
 
                     serviceClientEmail: Joi.string()
                         .email()
@@ -7155,6 +7185,8 @@ const init = async () => {
 
                     googleProjectId: googleProjectIdSchema,
                     googleWorkspaceAccounts: googleWorkspaceAccountsSchema,
+                    googleTopicName: googleTopicNameSchema,
+                    googleSubscriptionName: googleSubscriptionNameSchema,
 
                     serviceClientEmail: Joi.string()
                         .email()
@@ -7729,6 +7761,74 @@ const init = async () => {
                     user: Joi.string().max(256).required().example('user@example.com').description('Username'),
                     accessToken: Joi.string().max(256).required().example('aGVsbG8gd29ybGQ=').description('Access Token'),
                     provider: OAuth2ProviderSchema
+                }).label('AccountTokenResponse'),
+                failAction: 'log'
+            }
+        }
+    });
+
+    server.route({
+        method: 'GET',
+        path: '/v1/account/{account}/server-signatures',
+
+        async handler(request) {
+            let accountObject = new Account({
+                redis,
+                account: request.params.account,
+                call,
+                secret: await getSecret(),
+                timeout: request.headers['x-ee-timeout']
+            });
+            try {
+                return await accountObject.listSignatures(request.query);
+            } catch (err) {
+                request.logger.error({ msg: 'API request failed', err });
+                if (Boom.isBoom(err)) {
+                    throw err;
+                }
+                let error = Boom.boomify(err, { statusCode: err.statusCode || 500 });
+                if (err.code) {
+                    error.output.payload.code = err.code;
+                }
+                throw error;
+            }
+        },
+
+        options: {
+            description: 'List Account Signatures',
+            notes: 'Returns signatures associated with the account. Currently only Gmail is supported, and only "new message" signatures from the "sendAs" list are returned.',
+            tags: ['api', 'Account'],
+
+            plugins: {},
+
+            auth: {
+                strategy: 'api-token',
+                mode: 'required'
+            },
+            cors: CORS_CONFIG,
+
+            validate: {
+                options: {
+                    stripUnknown: false,
+                    abortEarly: false,
+                    convert: true
+                },
+                failAction,
+                params: Joi.object({
+                    account: accountIdSchema.required()
+                })
+            },
+
+            response: {
+                schema: Joi.object({
+                    signatures: Joi.array()
+                        .items(
+                            Joi.object({
+                                address: Joi.string().email().example('user@example.com').description('Email address associated with the signature').required(),
+                                signature: Joi.string().example('<div>Best regards,</div>').description('Signature HTML code').required()
+                            }).label('SignatureResponseItem')
+                        )
+                        .label('SignatureEntries')
                 }).label('AccountTokenResponse'),
                 failAction: 'log'
             }
@@ -8477,7 +8577,8 @@ ${now}`,
                 language,
                 locale,
                 timezone,
-                pageBrandName
+                pageBrandName,
+                notificationBaseUrl
             } = await settings.getMulti(
                 'upgrade',
                 'subexp',
@@ -8495,7 +8596,8 @@ ${now}`,
                 'language',
                 'locale',
                 'timezone',
-                'pageBrandName'
+                'pageBrandName',
+                'notificationBaseUrl'
             );
 
             const systemAlerts = [];
@@ -8654,6 +8756,9 @@ ${now}`,
                 currentYear: new Date().getFullYear(),
                 showDocumentStore,
                 updateBrowserInfo: !serviceUrl || !language || !timezone,
+
+                mainServiceUrl: serviceUrl,
+                notificationBaseUrl,
 
                 userLocale: locale,
                 userTimezone: timezone
